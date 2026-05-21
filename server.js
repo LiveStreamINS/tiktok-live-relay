@@ -589,8 +589,10 @@ function getRoom(roomId) {
         comboCarousel: [],
         translator: [],
         translatorMicControl: [],
-        figurinhas: []
+        figurinhas: [],
+        musica: []
       },
+      musica: { lastTrack: null },
       coinsRanking: {},
       likesRanking: {},
       pointsRanking: {},
@@ -819,6 +821,11 @@ app.get('/overlay/:roomId/translator', (req, res) => {
 app.get('/overlay/:roomId/figurinhas', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(getFigurinhasOverlayHTML(req.params.roomId));
+});
+
+app.get('/overlay/:roomId/musica', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(getMusicaOverlayHTML(req.params.roomId));
 });
 
 // Página do microfone (Chrome) — para Web Speech API que não funciona no Electron
@@ -1107,6 +1114,19 @@ app.get('/sse/:roomId/figurinhas', (req, res) => {
   res.write('data: {"type":"connected"}\n\n');
   room.sseClients.figurinhas.push(res);
   req.on('close', () => { room.sseClients.figurinhas = room.sseClients.figurinhas.filter(c => c !== res); });
+});
+
+// Música (overlay tocando agora) SSE
+app.get('/sse/:roomId/musica', (req, res) => {
+  const room = getRoom(req.params.roomId);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+  res.write('data: {"type":"connected"}\n\n');
+  if (room.musica && room.musica.lastTrack) {
+    res.write(`data: ${JSON.stringify({ type: 'track', track: room.musica.lastTrack })}\n\n`);
+  }
+  room.sseClients.musica = room.sseClients.musica || [];
+  room.sseClients.musica.push(res);
+  req.on('close', () => { room.sseClients.musica = room.sseClients.musica.filter(c => c !== res); });
 });
 
 // Canal de controle da página do microfone (recebe toggle via tecla de atalho)
@@ -1564,6 +1584,13 @@ wss.on('connection', (ws) => {
           volume: msg.volume || 80
         });
         room.sseClients.figurinhas.forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
+      }
+      // Música — atualiza overlay "tocando agora"
+      if (msg.type === 'musica-now-playing') {
+        room.musica = room.musica || { lastTrack: null };
+        room.musica.lastTrack = msg.track || null;
+        const ev = JSON.stringify({ type: 'track', track: msg.track || null });
+        (room.sseClients.musica || []).forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
       }
       // Tradutor de voz — comando de toggle da página do microfone (vindo da tecla de atalho)
       if (msg.type === 'translator-mic-toggle') {
@@ -7148,6 +7175,99 @@ body { background:transparent; width:100vw; height:100vh; overflow:hidden; }
       es.close();
       setTimeout(connect, 3000);
     };
+  }
+  connect();
+</script>
+</body></html>`;
+}
+
+function getMusicaOverlayHTML(roomId) {
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:transparent; font-family:'Segoe UI',Arial,sans-serif; overflow:hidden; }
+#card {
+  position:fixed; left:20px; bottom:20px;
+  display:flex; align-items:center; gap:14px;
+  background:rgba(10,10,12,0.92);
+  border:1px solid rgba(29,185,84,0.4);
+  border-radius:14px; padding:12px 18px 12px 12px;
+  min-width:280px; max-width:480px;
+  box-shadow:0 8px 30px rgba(0,0,0,0.5), 0 0 24px rgba(29,185,84,0.15);
+  opacity:0; transform:translateY(20px);
+  transition:opacity 0.4s, transform 0.4s;
+  pointer-events:none;
+}
+#card.visible { opacity:1; transform:translateY(0); }
+#cover {
+  width:64px; height:64px; border-radius:8px; object-fit:cover;
+  background:rgba(255,255,255,0.05);
+  flex-shrink:0;
+}
+#info { flex:1; min-width:0; color:#fff; }
+.label {
+  font-size:10px; font-weight:700; letter-spacing:1.2px;
+  color:#1DB954; text-transform:uppercase; margin-bottom:3px;
+  display:flex; align-items:center; gap:6px;
+}
+.label .dot {
+  width:8px; height:8px; border-radius:50%; background:#1DB954;
+  box-shadow:0 0 8px rgba(29,185,84,0.7);
+  animation:pulse 1.5s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
+.title { font-size:14px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.artist { font-size:12px; color:rgba(255,255,255,0.6); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.req { font-size:10px; color:#1DB954; margin-top:4px; }
+</style></head>
+<body>
+<div id="card">
+  <img id="cover" src="">
+  <div id="info">
+    <div class="label"><span class="dot"></span>Tocando agora</div>
+    <div class="title" id="title">—</div>
+    <div class="artist" id="artist">—</div>
+    <div class="req" id="req"></div>
+  </div>
+</div>
+<script>
+  var card = document.getElementById('card');
+  var cover = document.getElementById('cover');
+  var titleEl = document.getElementById('title');
+  var artistEl = document.getElementById('artist');
+  var reqEl = document.getElementById('req');
+  var hideTimer = null;
+  var lastTrackId = null;
+
+  function showTrack(track, ephemeral) {
+    if (!track) {
+      card.classList.remove('visible');
+      lastTrackId = null;
+      return;
+    }
+    var changed = lastTrackId !== track.id;
+    lastTrackId = track.id;
+    cover.src = track.albumImage || '';
+    titleEl.textContent = track.name || '—';
+    artistEl.textContent = track.artists || '—';
+    reqEl.textContent = track.requestedBy ? 'Pedida por @' + track.requestedBy : '';
+    card.classList.add('visible');
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    // Mostra por 10s quando muda música (ou em !atual), depois esconde
+    if (changed || ephemeral) {
+      hideTimer = setTimeout(function(){ card.classList.remove('visible'); }, 10000);
+    }
+  }
+
+  function connect() {
+    var es = new EventSource('/sse/${roomId}/musica');
+    es.onmessage = function(e) {
+      try {
+        var d = JSON.parse(e.data);
+        if (d.type === 'track') showTrack(d.track, !!(d.track && d.track.showPulse));
+      } catch(err) {}
+    };
+    es.onerror = function() { es.close(); setTimeout(connect, 3000); };
   }
   connect();
 </script>
