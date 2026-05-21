@@ -1605,8 +1605,14 @@ wss.on('connection', (ws) => {
       // YouTube — broadcasts state (currentTrack + queue) pro overlay
       if (msg.type === 'youtube-state') {
         room.musica = room.musica || { lastTrack: null };
-        room.musica.youtubeState = { currentTrack: msg.currentTrack || null, queue: msg.queue || [] };
-        const ev = JSON.stringify({ type: 'youtube-state', currentTrack: msg.currentTrack || null, queue: msg.queue || [] });
+        room.musica.youtubeState = { currentTrack: msg.currentTrack || null, queue: msg.queue || [], volume: msg.volume };
+        const ev = JSON.stringify({ type: 'youtube-state', currentTrack: msg.currentTrack || null, queue: msg.queue || [], volume: msg.volume });
+        (room.sseClients.musica || []).forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
+      }
+      if (msg.type === 'youtube-volume') {
+        room.musica = room.musica || { lastTrack: null };
+        if (room.musica.youtubeState) room.musica.youtubeState.volume = msg.volume;
+        const ev = JSON.stringify({ type: 'youtube-volume', volume: msg.volume });
         (room.sseClients.musica || []).forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
       }
       if (msg.type === 'youtube-pulse') {
@@ -7255,6 +7261,7 @@ body { background:transparent; overflow:hidden; font-family:'Segoe UI',Arial,san
   var playerReady = false;
   var pendingVideoId = null;
   var currentVideoId = null;
+  var currentVolume = 80;
   var card = document.getElementById('card');
   var playerWrap = document.getElementById('player-wrap');
   var cover = document.getElementById('cover');
@@ -7274,7 +7281,13 @@ body { background:transparent; overflow:hidden; font-family:'Segoe UI',Arial,san
     hideTimer = setTimeout(function(){ card.classList.remove('visible'); }, ephemeral ? 10000 : 12000);
   }
 
+  function applyVolume(v) {
+    currentVolume = Math.max(0, Math.min(100, parseInt(v) || 0));
+    if (playerReady && player) { try { player.setVolume(currentVolume); } catch(e){} }
+  }
+
   function applyState(state) {
+    if (state && typeof state.volume === 'number') applyVolume(state.volume);
     var track = state && state.currentTrack;
     if (!track) {
       currentVideoId = null;
@@ -7304,7 +7317,7 @@ body { background:transparent; overflow:hidden; font-family:'Segoe UI',Arial,san
       events: {
         onReady: function(e){
           playerReady = true;
-          e.target.setVolume(80);
+          e.target.setVolume(currentVolume);
           if (pendingVideoId) { player.loadVideoById(pendingVideoId); pendingVideoId = null; }
         },
         onStateChange: function(e){
@@ -7327,6 +7340,7 @@ body { background:transparent; overflow:hidden; font-family:'Segoe UI',Arial,san
       try {
         var d = JSON.parse(e.data);
         if (d.type === 'youtube-state') applyState(d);
+        else if (d.type === 'youtube-volume') applyVolume(d.volume);
         else if (d.type === 'youtube-pulse' && currentVideoId) {
           showCard({ id: currentVideoId, title: titleEl.textContent, channel: channelEl.textContent, requestedBy: (reqEl.textContent.replace(/^Pedida por @/,'') || null), thumbnail: cover.src }, true);
         }
