@@ -828,6 +828,15 @@ app.get('/overlay/:roomId/musica', (req, res) => {
   res.send(getMusicaOverlayHTML(req.params.roomId));
 });
 
+// Notifica app quando vídeo do YouTube termina (overlay → relay → app via WS reverso)
+app.post('/api/youtube-track-ended/:roomId', (req, res) => {
+  const room = getRoom(req.params.roomId);
+  if (room && room.appWs && room.appWs.readyState === 1) {
+    try { room.appWs.send(JSON.stringify({ type: 'youtube-track-ended' })); } catch(e){}
+  }
+  res.json({ ok: true });
+});
+
 // Página do microfone (Chrome) — para Web Speech API que não funciona no Electron
 app.get('/translator-mic/:roomId', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -1160,7 +1169,8 @@ wss.on('connection', (ws) => {
 
       if (msg.type === 'join') {
         roomId = msg.roomId;
-        getRoom(roomId);
+        const room = getRoom(roomId);
+        room.appWs = ws;
         ws.send(JSON.stringify({ type: 'joined', roomId }));
         return;
       }
@@ -1590,6 +1600,17 @@ wss.on('connection', (ws) => {
         room.musica = room.musica || { lastTrack: null };
         room.musica.lastTrack = msg.track || null;
         const ev = JSON.stringify({ type: 'track', track: msg.track || null });
+        (room.sseClients.musica || []).forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
+      }
+      // YouTube — broadcasts state (currentTrack + queue) pro overlay
+      if (msg.type === 'youtube-state') {
+        room.musica = room.musica || { lastTrack: null };
+        room.musica.youtubeState = { currentTrack: msg.currentTrack || null, queue: msg.queue || [] };
+        const ev = JSON.stringify({ type: 'youtube-state', currentTrack: msg.currentTrack || null, queue: msg.queue || [] });
+        (room.sseClients.musica || []).forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
+      }
+      if (msg.type === 'youtube-pulse') {
+        const ev = JSON.stringify({ type: 'youtube-pulse' });
         (room.sseClients.musica || []).forEach(c => { try { c.write(`data: ${ev}\n\n`); } catch(e){} });
       }
       // Tradutor de voz — comando de toggle da página do microfone (vindo da tecla de atalho)
@@ -7185,86 +7206,130 @@ function getMusicaOverlayHTML(roomId) {
   return `<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
-body { background:transparent; font-family:'Segoe UI',Arial,sans-serif; overflow:hidden; }
+body { background:transparent; overflow:hidden; font-family:'Segoe UI',Arial,sans-serif; width:100vw; height:100vh; }
+#player-wrap {
+  position:fixed; left:20px; top:20px;
+  width:320px; height:180px; border-radius:12px; overflow:hidden;
+  box-shadow:0 8px 30px rgba(0,0,0,0.5);
+  background:#000;
+  display:none;
+}
+#player-wrap.visible { display:block; }
+#player { width:100%; height:100%; }
 #card {
   position:fixed; left:20px; bottom:20px;
   display:flex; align-items:center; gap:14px;
   background:rgba(10,10,12,0.92);
-  border:1px solid rgba(29,185,84,0.4);
+  border:1px solid rgba(239,68,68,0.4);
   border-radius:14px; padding:12px 18px 12px 12px;
   min-width:280px; max-width:480px;
-  box-shadow:0 8px 30px rgba(0,0,0,0.5), 0 0 24px rgba(29,185,84,0.15);
+  box-shadow:0 8px 30px rgba(0,0,0,0.5), 0 0 24px rgba(239,68,68,0.15);
   opacity:0; transform:translateY(20px);
   transition:opacity 0.4s, transform 0.4s;
   pointer-events:none;
 }
 #card.visible { opacity:1; transform:translateY(0); }
-#cover {
-  width:64px; height:64px; border-radius:8px; object-fit:cover;
-  background:rgba(255,255,255,0.05);
-  flex-shrink:0;
-}
+#cover { width:96px; height:54px; border-radius:6px; object-fit:cover; background:rgba(255,255,255,0.05); flex-shrink:0; }
 #info { flex:1; min-width:0; color:#fff; }
-.label {
-  font-size:10px; font-weight:700; letter-spacing:1.2px;
-  color:#1DB954; text-transform:uppercase; margin-bottom:3px;
-  display:flex; align-items:center; gap:6px;
-}
-.label .dot {
-  width:8px; height:8px; border-radius:50%; background:#1DB954;
-  box-shadow:0 0 8px rgba(29,185,84,0.7);
-  animation:pulse 1.5s ease-in-out infinite;
-}
+.label { font-size:10px; font-weight:700; letter-spacing:1.2px; color:#ef4444; text-transform:uppercase; margin-bottom:3px; display:flex; align-items:center; gap:6px; }
+.label .dot { width:8px; height:8px; border-radius:50%; background:#ef4444; box-shadow:0 0 8px rgba(239,68,68,0.7); animation:pulse 1.5s ease-in-out infinite; }
 @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
 .title { font-size:14px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.artist { font-size:12px; color:rgba(255,255,255,0.6); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.req { font-size:10px; color:#1DB954; margin-top:4px; }
+.channel { font-size:12px; color:rgba(255,255,255,0.6); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.req { font-size:10px; color:#ef4444; margin-top:4px; }
 </style></head>
 <body>
+<div id="player-wrap"><div id="player"></div></div>
 <div id="card">
   <img id="cover" src="">
   <div id="info">
     <div class="label"><span class="dot"></span>Tocando agora</div>
     <div class="title" id="title">—</div>
-    <div class="artist" id="artist">—</div>
+    <div class="channel" id="channel">—</div>
     <div class="req" id="req"></div>
   </div>
 </div>
+<script src="https://www.youtube.com/iframe_api"></script>
 <script>
+  var player = null;
+  var playerReady = false;
+  var pendingVideoId = null;
+  var currentVideoId = null;
   var card = document.getElementById('card');
+  var playerWrap = document.getElementById('player-wrap');
   var cover = document.getElementById('cover');
   var titleEl = document.getElementById('title');
-  var artistEl = document.getElementById('artist');
+  var channelEl = document.getElementById('channel');
   var reqEl = document.getElementById('req');
   var hideTimer = null;
-  var lastTrackId = null;
 
-  function showTrack(track, ephemeral) {
-    if (!track) {
-      card.classList.remove('visible');
-      lastTrackId = null;
-      return;
-    }
-    var changed = lastTrackId !== track.id;
-    lastTrackId = track.id;
-    cover.src = track.albumImage || '';
-    titleEl.textContent = track.name || '—';
-    artistEl.textContent = track.artists || '—';
+  function showCard(track, ephemeral) {
+    if (!track) { card.classList.remove('visible'); return; }
+    cover.src = track.thumbnail || '';
+    titleEl.textContent = track.title || '—';
+    channelEl.textContent = track.channel || '—';
     reqEl.textContent = track.requestedBy ? 'Pedida por @' + track.requestedBy : '';
     card.classList.add('visible');
     if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
-    // Mostra por 10s quando muda música (ou em !atual), depois esconde
-    if (changed || ephemeral) {
-      hideTimer = setTimeout(function(){ card.classList.remove('visible'); }, 10000);
+    hideTimer = setTimeout(function(){ card.classList.remove('visible'); }, ephemeral ? 10000 : 12000);
+  }
+
+  function applyState(state) {
+    var track = state && state.currentTrack;
+    if (!track) {
+      currentVideoId = null;
+      playerWrap.classList.remove('visible');
+      card.classList.remove('visible');
+      if (playerReady && player) { try { player.stopVideo(); } catch(e){} }
+      return;
+    }
+    showCard(track, false);
+    if (track.id !== currentVideoId) {
+      currentVideoId = track.id;
+      playerWrap.classList.add('visible');
+      if (playerReady && player) {
+        player.loadVideoById(track.id);
+      } else {
+        pendingVideoId = track.id;
+      }
     }
   }
 
+  window.onYouTubeIframeAPIReady = function() {
+    player = new YT.Player('player', {
+      height: '180',
+      width: '320',
+      videoId: '',
+      playerVars: { autoplay: 1, controls: 0, modestbranding: 1, rel: 0, playsinline: 1 },
+      events: {
+        onReady: function(e){
+          playerReady = true;
+          e.target.setVolume(80);
+          if (pendingVideoId) { player.loadVideoById(pendingVideoId); pendingVideoId = null; }
+        },
+        onStateChange: function(e){
+          if (e.data === YT.PlayerState.ENDED) {
+            fetch('/api/youtube-track-ended/' + ROOMID, { method:'POST' }).catch(function(){});
+          }
+        },
+        onError: function(){
+          fetch('/api/youtube-track-ended/' + ROOMID, { method:'POST' }).catch(function(){});
+        }
+      }
+    });
+  };
+
+  var ROOMID = ${JSON.stringify(roomId)};
+
   function connect() {
-    var es = new EventSource('/sse/${roomId}/musica');
+    var es = new EventSource('/sse/' + ROOMID + '/musica');
     es.onmessage = function(e) {
       try {
         var d = JSON.parse(e.data);
-        if (d.type === 'track') showTrack(d.track, !!(d.track && d.track.showPulse));
+        if (d.type === 'youtube-state') applyState(d);
+        else if (d.type === 'youtube-pulse' && currentVideoId) {
+          showCard({ id: currentVideoId, title: titleEl.textContent, channel: channelEl.textContent, requestedBy: (reqEl.textContent.replace(/^Pedida por @/,'') || null), thumbnail: cover.src }, true);
+        }
       } catch(err) {}
     };
     es.onerror = function() { es.close(); setTimeout(connect, 3000); };
@@ -7273,7 +7338,6 @@ body { background:transparent; font-family:'Segoe UI',Arial,sans-serif; overflow
 </script>
 </body></html>`;
 }
-
 function getTranslatorMicHTML(roomId) {
   return `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <title>🎙️ Microfone do Tradutor — Live Stream INS</title>
